@@ -14,14 +14,13 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use openssl::rsa::Rsa;
 use time::Duration;
 
 use hickory_client::client::Client;
 use hickory_client::client::ClientHandle;
 use hickory_client::proto::op::ResponseCode;
 use hickory_client::proto::rr::dnssec::rdata::key::{KeyUsage, KEY};
-use hickory_client::proto::rr::dnssec::{Algorithm, KeyPair, SigSigner};
+use hickory_client::proto::rr::dnssec::{Algorithm, RsaSigningKey, SigSigner, SigningKey};
 use hickory_client::proto::rr::Name;
 use hickory_client::proto::rr::{DNSClass, RData, Record, RecordType};
 use hickory_client::proto::runtime::TokioRuntimeProvider;
@@ -68,8 +67,7 @@ async fn test_create() {
 
     let mut pem_buf = Vec::<u8>::new();
     pem.read_to_end(&mut pem_buf).expect("failed to read pem");
-    let rsa = Rsa::private_key_from_pem(&pem_buf).expect("something wrong with key from pem");
-    let key = KeyPair::from_rsa(rsa, Algorithm::RSASHA256).unwrap();
+    let key = RsaSigningKey::generate(Algorithm::RSASHA256).unwrap();
     let sig0key = KEY::new(
         Default::default(),
         KeyUsage::Entity,
@@ -79,7 +77,11 @@ async fn test_create() {
         key.to_public_key().unwrap().into_inner(),
     );
 
-    let signer = SigSigner::sig0(sig0key, key, Name::from_str("update.example.com").unwrap());
+    let signer = SigSigner::sig0(
+        sig0key,
+        Box::new(key),
+        Name::from_str("update.example.com").unwrap(),
+    );
     assert_eq!(signer.calculate_key_tag().unwrap(), 56935_u16);
 
     let (_process, port) = named_process();

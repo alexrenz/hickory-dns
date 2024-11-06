@@ -42,10 +42,12 @@ fn trust_anchor(
     let mut buf = Vec::<u8>::new();
 
     file.read_to_end(&mut buf).expect("could not read key");
-    let key_pair = format
-        .decode_key(&buf, Some("123456"), algorithm)
-        .expect("could not decode key");
+    let password = match format {
+        KeyFormat::Pem => Some("123456"),
+        _ => None,
+    };
 
+    let key_pair = decode_key(&buf, password, algorithm, format).expect("could not decode key");
     let public_key = key_pair.to_public_key().unwrap();
     let mut trust_anchor = TrustAnchor::new();
 

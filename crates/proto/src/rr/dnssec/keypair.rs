@@ -6,6 +6,9 @@
 // copied, modified, or distributed except according to those terms.
 
 #[cfg(feature = "dnssec-openssl")]
+use std::iter;
+
+#[cfg(feature = "dnssec-openssl")]
 use openssl::ec::{EcGroup, EcKey};
 #[cfg(feature = "dnssec-openssl")]
 use openssl::nid::Nid;
@@ -14,44 +17,132 @@ use openssl::pkey::{PKey, Private};
 #[cfg(feature = "dnssec-openssl")]
 use openssl::rsa::Rsa as OpenSslRsa;
 #[cfg(feature = "dnssec-openssl")]
-use openssl::sign::Signer;
+use openssl::symm::Cipher;
 
 #[cfg(feature = "dnssec-ring")]
 use ring::{
-    rand,
+    rand::{self, SystemRandom},
     signature::{
         EcdsaKeyPair, Ed25519KeyPair, KeyPair as RingKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING,
         ECDSA_P384_SHA384_FIXED_SIGNING,
     },
 };
 
+use super::KeyFormat;
 use crate::error::{DnsSecErrorKind, DnsSecResult};
 #[cfg(feature = "dnssec-openssl")]
 use crate::rr::dnssec::DigestType;
 use crate::rr::dnssec::{Algorithm, PublicKeyBuf, TBS};
 
-/// A public and private key pair, the private portion is not required.
-///
-/// This supports all the various public/private keys which Hickory DNS is capable of using. Given
-///  differing features, some key types may not be available. The `openssl` feature will enable RSA and EC
-///  (P256 and P384). The `ring` feature enables ED25519, in the future, Ring will also be used for other keys.
-#[allow(clippy::large_enum_variant)]
-pub enum KeyPair {
-    /// RSA keypair, supported by OpenSSL
-    #[cfg(feature = "dnssec-openssl")]
-    RSA(PKey<Private>, Algorithm),
-    /// Elliptic curve keypair, supported by OpenSSL
-    #[cfg(feature = "dnssec-openssl")]
-    EC(PKey<Private>, Algorithm),
-    /// *ring* ECDSA keypair
-    #[cfg(feature = "dnssec-ring")]
-    ECDSA(EcdsaKeyPair),
-    /// ED25519 encryption and hash defined keypair
-    #[cfg(feature = "dnssec-ring")]
-    ED25519(Ed25519KeyPair),
+/// Decode key bytes according to given [`Algorithm`] and [`KeyFormat`].
+pub fn decode_key(
+    bytes: &[u8],
+    password: Option<&str>,
+    algorithm: Algorithm,
+    format: KeyFormat,
+) -> DnsSecResult<Box<dyn SigningKey>> {
+    Ok(match algorithm {
+        #[cfg(feature = "dnssec-openssl")]
+        Algorithm::RSASHA256 | Algorithm::RSASHA512 => Box::new(
+            RsaSigningKey::decode_key(bytes, password, algorithm, format)
+                .map_err(|e| format!("could not decode key: {e}"))?,
+        ),
+        #[cfg(feature = "dnssec-openssl")]
+        Algorithm::ECDSAP256SHA256 | Algorithm::ECDSAP384SHA384 => Box::new(
+            EcSigningKey::decode_key(bytes, password, algorithm, format)
+                .map_err(|e| format!("could not decode key: {e}"))?,
+        ),
+        #[allow(unreachable_patterns)] // Unreachable when both features are enabled
+        #[cfg(feature = "dnssec-ring")]
+        Algorithm::ECDSAP256SHA256 | Algorithm::ECDSAP384SHA384 => match (format, password) {
+            (KeyFormat::Pkcs8, None) => Box::new(
+                EcdsaSigningKey::from_pkcs8(bytes, algorithm)
+                    .map_err(|e| format!("could not decode key: {e}"))?,
+            ),
+            (_, Some(_)) => {
+                return Err("password protected keys are not supported with ring".into())
+            }
+            _ => return Err(format!("unsupported format for ECDSA keys: {format:?}").into()),
+        },
+        #[cfg(feature = "dnssec-ring")]
+        Algorithm::ED25519 => match (format, password) {
+            (KeyFormat::Pkcs8, None) => Box::new(
+                Ed25519SigningKey::from_pkcs8(bytes)
+                    .map_err(|e| format!("could not decode key: {e}"))?,
+            ),
+            (_, Some(_)) => {
+                return Err("password protected keys are not supported with ring".into())
+            }
+            _ => return Err(format!("unsupported format for ed25519 keys: {format:?}").into()),
+        },
+        _ => return Err(format!("unsupported algorithm: {algorithm}").into()),
+    })
 }
 
-impl KeyPair {
+/// An RSA signing key pair (backed by OpenSSL).
+#[cfg(feature = "dnssec-openssl")]
+pub struct RsaSigningKey {
+    inner: PKey<Private>,
+    algorithm: DigestType,
+}
+
+#[cfg(feature = "dnssec-openssl")]
+impl RsaSigningKey {
+    /// Generates a 2048-bits RSA key pair.
+    ///
+    /// Errors unless the given algorithm is one of the following:
+    ///
+    /// - [`Algorithm::RSASHA1`]
+    /// - [`Algorithm::RSASHA1NSEC3SHA1`]
+    /// - [`Algorithm::RSASHA256`]
+    /// - [`Algorithm::RSASHA512`]
+    pub fn generate(algorithm: Algorithm) -> DnsSecResult<Self> {
+        Self::from_rsa(OpenSslRsa::generate(2_048)?, algorithm)
+    }
+
+    /// Decode signing key pair from bytes according to the given `format`.
+    ///
+    /// Errors unless the given algorithm is one of the following:
+    ///
+    /// - [`Algorithm::RSASHA256`]
+    /// - [`Algorithm::RSASHA512`]
+    pub fn decode_key(
+        bytes: &[u8],
+        password: Option<&str>,
+        algorithm: Algorithm,
+        format: KeyFormat,
+    ) -> DnsSecResult<Self> {
+        match algorithm {
+            #[allow(deprecated)]
+            e @ Algorithm::RSASHA1 | e @ Algorithm::RSASHA1NSEC3SHA1 => {
+                return Err(format!("unsupported Algorithm (insecure): {e:?}").into())
+            }
+            Algorithm::RSASHA256 | Algorithm::RSASHA512 => {}
+            e => {
+                return Err(format!("invalid Algorithm for RSA: {e:?}").into());
+            }
+        }
+
+        let key = match format {
+            KeyFormat::Der => OpenSslRsa::private_key_from_der(bytes)
+                .map_err(|e| format!("error reading RSA as DER: {e}"))?,
+            KeyFormat::Pem => {
+                //  empty string prevents openssl from triggering a read from stdin...
+                let password = password.unwrap_or("");
+                OpenSslRsa::private_key_from_pem_passphrase(bytes, password.as_bytes())
+                    .map_err(|e| format!("could not decode RSA from PEM, bad password?: {e}"))?
+            }
+            e => {
+                return Err(
+                    format!("unsupported key format with RSA (DER or PEM only): {e:?}").into(),
+                )
+            }
+        };
+
+        Ok(Self::from_rsa(key, algorithm)
+            .map_err(|e| format!("could not decode RSA key pair: {e}"))?)
+    }
+
     /// Creates an RSA type keypair.
     ///
     /// Errors unless the given algorithm is one of the following:
@@ -60,7 +151,6 @@ impl KeyPair {
     /// - [`Algorithm::RSASHA1NSEC3SHA1`]
     /// - [`Algorithm::RSASHA256`]
     /// - [`Algorithm::RSASHA512`]
-    #[cfg(feature = "dnssec-openssl")]
     pub fn from_rsa(rsa: OpenSslRsa<Private>, algorithm: Algorithm) -> DnsSecResult<Self> {
         Self::from_rsa_pkey(PKey::from_rsa(rsa)?, algorithm)
     }
@@ -73,206 +163,66 @@ impl KeyPair {
     /// - [`Algorithm::RSASHA1NSEC3SHA1`]
     /// - [`Algorithm::RSASHA256`]
     /// - [`Algorithm::RSASHA512`]
-    #[cfg(feature = "dnssec-openssl")]
-    pub fn from_rsa_pkey(pkey: PKey<Private>, algorithm: Algorithm) -> DnsSecResult<Self> {
+    pub fn from_rsa_pkey(inner: PKey<Private>, algorithm: Algorithm) -> DnsSecResult<Self> {
         match algorithm {
             #[allow(deprecated)]
             Algorithm::RSASHA1
             | Algorithm::RSASHA1NSEC3SHA1
             | Algorithm::RSASHA256
-            | Algorithm::RSASHA512 => Ok(Self::RSA(pkey, algorithm)),
+            | Algorithm::RSASHA512 => Ok(Self {
+                inner,
+                algorithm: DigestType::from(algorithm),
+            }),
             _ => Err(DnsSecErrorKind::Message("unsupported signing algorithm").into()),
         }
     }
 
-    /// Creates an EC, elliptic curve, type keypair, only P256 or P384 are supported.
-    #[cfg(feature = "dnssec-openssl")]
-    pub fn from_ec_key(ec_key: EcKey<Private>, algorithm: Algorithm) -> DnsSecResult<Self> {
-        Self::from_ec_pkey(PKey::from_ec_key(ec_key)?, algorithm)
+    /// Encode the key pair to DER-encoded ASN.1 bytes.
+    pub fn encode_der(&self) -> DnsSecResult<Vec<u8>> {
+        self.inner
+            .private_key_to_der()
+            .map_err(|e| format!("error writing key as DER: {e}").into())
     }
 
-    /// Given a known pkey of an EC key, return the wrapped keypair
-    #[cfg(feature = "dnssec-openssl")]
-    pub fn from_ec_pkey(pkey: PKey<Private>, algorithm: Algorithm) -> DnsSecResult<Self> {
-        match algorithm {
-            Algorithm::ECDSAP256SHA256 | Algorithm::ECDSAP384SHA384 => {
-                Ok(Self::EC(pkey, algorithm))
-            }
-            _ => Err(DnsSecErrorKind::Message("unsupported signing algorithm").into()),
+    /// Encode the key pair to DER-encoded ASN.1 bytes, optionally encrypted with `password`.
+    pub fn encode_pem(&self, password: Option<&str>) -> DnsSecResult<Vec<u8>> {
+        if let Some(password) = password {
+            self.inner
+                .private_key_to_pem_pkcs8_passphrase(Cipher::aes_256_cbc(), password.as_bytes())
+        } else {
+            self.inner.private_key_to_pem_pkcs8()
         }
+        .map_err(|e| format!("error writing key as PEM: {e}").into())
+    }
+}
+
+#[cfg(feature = "dnssec-openssl")]
+impl SigningKey for RsaSigningKey {
+    fn sign(&self, tbs: &TBS) -> DnsSecResult<Vec<u8>> {
+        let digest = self.algorithm.to_openssl_digest()?;
+        let mut signer = openssl::sign::Signer::new(digest, &self.inner)?;
+        signer.update(tbs.as_ref())?;
+        Ok(signer.sign_to_vec()?)
     }
 
-    /// Creates an ECDSA keypair with ring.
-    #[cfg(feature = "dnssec-ring")]
-    pub fn from_ecdsa(ec_key: EcdsaKeyPair) -> Self {
-        Self::ECDSA(ec_key)
+    fn to_public_key(&self) -> DnsSecResult<PublicKeyBuf> {
+        let rsa = self.inner.rsa()?;
+        Ok(PublicKeyBuf::from_rsa(&rsa))
     }
+}
 
-    /// Creates an ED25519 keypair.
-    #[cfg(feature = "dnssec-ring")]
-    pub fn from_ed25519(ed_key: Ed25519KeyPair) -> Self {
-        Self::ED25519(ed_key)
-    }
+/// An ECDSA signing key pair (backed by OpenSSL).
+#[cfg(feature = "dnssec-openssl")]
+pub struct EcSigningKey {
+    inner: PKey<Private>,
+    algorithm: DigestType,
+}
 
-    /// Converts this keypair to the DNS binary form of the public_key.
-    ///
-    /// If there is a private key associated with this keypair, it will not be included in this
-    ///  format. Only the public key material will be included.
-    fn to_public_bytes(&self) -> DnsSecResult<Vec<u8>> {
-        #[allow(unreachable_patterns)]
-        match self {
-            // see from_vec() RSA sections for reference
-            #[cfg(feature = "dnssec-openssl")]
-            Self::RSA(pkey, _) => {
-                // TODO: make these expects a try! and Err()
-                let rsa = pkey
-                    .rsa()
-                    .expect("pkey should have been initialized with RSA");
-                Ok(PublicKeyBuf::from_rsa(rsa).into_inner())
-            }
-            // see from_vec() ECDSA sections for reference
-            #[cfg(feature = "dnssec-openssl")]
-            Self::EC(pkey, _) => {
-                // TODO: make these expects a try! and Err()
-                let ec_key = pkey
-                    .ec_key()
-                    .expect("pkey should have been initialized with EC");
-                Ok(PublicKeyBuf::from_ec(ec_key)?.into_inner())
-            }
-            #[cfg(feature = "dnssec-ring")]
-            Self::ECDSA(ec_key) => {
-                let mut bytes: Vec<u8> = ec_key.public_key().as_ref().to_vec();
-                bytes.remove(0);
-                Ok(bytes)
-            }
-            #[cfg(feature = "dnssec-ring")]
-            Self::ED25519(ed_key) => Ok(ed_key.public_key().as_ref().to_vec()),
-            #[cfg(not(any(feature = "dnssec-openssl", feature = "dnssec-ring")))]
-            _ => Err(DnsSecErrorKind::Message("openssl or ring feature(s) not enabled").into()),
-        }
-    }
-
-    /// Returns a PublicKeyBuf of the KeyPair
-    pub fn to_public_key(&self) -> DnsSecResult<PublicKeyBuf> {
-        Ok(PublicKeyBuf::new(self.to_public_bytes()?))
-    }
-
-    /// Signs a hash.
-    ///
-    /// This will panic if the `key` is not a private key and can be used for signing.
-    ///
-    /// # Arguments
-    ///
-    /// * `message` - the message bytes to be signed, see `rrset_tbs`.
-    ///
-    /// # Return value
-    ///
-    /// The signature, ready to be stored in an `RData::RRSIG`.
-    #[allow(unused)]
-    pub fn sign(&self, tbs: &TBS) -> DnsSecResult<Vec<u8>> {
-        use std::iter;
-
-        match self {
-            #[cfg(feature = "dnssec-openssl")]
-            Self::RSA(pkey, algorithm) | Self::EC(pkey, algorithm) => {
-                let digest_type = DigestType::from(*algorithm).to_openssl_digest()?;
-                let mut signer = Signer::new(digest_type, pkey)?;
-                signer.update(tbs.as_ref())?;
-                signer.sign_to_vec().map_err(Into::into).and_then(|bytes| {
-                    if let Self::RSA(_, _) = self {
-                        return Ok(bytes);
-                    }
-
-                    // Convert DER signature to raw signature (see RFC 6605 Section 4)
-                    if bytes.len() < 8 {
-                        return Err("unexpected signature format (length too short)".into());
-                    }
-                    let expect = |pos: usize, expected: u8| -> DnsSecResult<()> {
-                        if bytes[pos] != expected {
-                            return Err(format!(
-                                "unexpected signature format ({pos}, {expected}))"
-                            )
-                            .into());
-                        }
-                        Ok(())
-                    };
-                    // Sanity checks
-                    expect(0, 0x30)?;
-                    expect(1, (bytes.len() - 2) as u8)?;
-                    expect(2, 0x02)?;
-                    let p1_len = bytes[3] as usize;
-                    let p2_pos = 4 + p1_len;
-                    expect(p2_pos, 0x02)?;
-                    let p2_len = bytes[p2_pos + 1] as usize;
-                    if p2_pos + 2 + p2_len > bytes.len() {
-                        return Err("unexpected signature format (invalid length)".into());
-                    }
-
-                    let p1 = &bytes[4..p2_pos];
-                    let p2 = &bytes[p2_pos + 2..p2_pos + 2 + p2_len];
-
-                    // For P-256, each integer MUST be encoded as 32 octets;
-                    // for P-384, each integer MUST be encoded as 48 octets.
-                    let part_len = match algorithm {
-                        Algorithm::ECDSAP256SHA256 => 32,
-                        Algorithm::ECDSAP384SHA384 => 48,
-                        _ => return Err("unexpected algorithm".into()),
-                    };
-                    let mut ret = Vec::<u8>::new();
-                    {
-                        let mut write_part = |mut part: &[u8]| -> DnsSecResult<()> {
-                            // We need to pad or trim the octet string to expected length
-                            if part.len() > part_len + 1 {
-                                return Err("invalid signature data".into());
-                            }
-                            if part.len() == part_len + 1 {
-                                // Trim leading zero
-                                if part[0] != 0x00 {
-                                    return Err("invalid signature data".into());
-                                }
-                                part = &part[1..];
-                            }
-
-                            // Pad with zeros. All numbers are big-endian here.
-                            ret.extend(iter::repeat(0x00).take(part_len - part.len()));
-                            ret.extend(part);
-                            Ok(())
-                        };
-                        write_part(p1)?;
-                        write_part(p2)?;
-                    }
-                    assert_eq!(ret.len(), part_len * 2);
-                    Ok(ret)
-                })
-            }
-            #[cfg(feature = "dnssec-ring")]
-            Self::ECDSA(ec_key) => {
-                let rng = rand::SystemRandom::new();
-                Ok(ec_key.sign(&rng, tbs.as_ref())?.as_ref().to_vec())
-            }
-            #[cfg(feature = "dnssec-ring")]
-            Self::ED25519(ed_key) => Ok(ed_key.sign(tbs.as_ref()).as_ref().to_vec()),
-            #[cfg(not(any(feature = "dnssec-openssl", feature = "dnssec-ring")))]
-            _ => Err(DnsSecErrorKind::Message("openssl nor ring feature(s) not enabled").into()),
-        }
-    }
-
-    /// Generates a new private and public key pair for the specified algorithm.
-    ///
-    /// RSA keys are hardcoded to 2048bits at the moment. Other keys have predefined sizes.
+#[cfg(feature = "dnssec-openssl")]
+impl EcSigningKey {
+    /// Generates a 2048-bits RSA key pair.
     pub fn generate(algorithm: Algorithm) -> DnsSecResult<Self> {
-        #[allow(deprecated)]
         match algorithm {
-            Algorithm::Unknown(_) => Err(DnsSecErrorKind::Message("unknown algorithm").into()),
-            #[cfg(feature = "dnssec-openssl")]
-            Algorithm::RSASHA1
-            | Algorithm::RSASHA1NSEC3SHA1
-            | Algorithm::RSASHA256
-            | Algorithm::RSASHA512 => {
-                // TODO: the only keysize right now, would be better for people to use other algorithms...
-                let inner = OpenSslRsa::generate(2_048)?;
-                Self::from_rsa(inner, algorithm)
-            }
             #[cfg(feature = "dnssec-openssl")]
             Algorithm::ECDSAP256SHA256 => {
                 let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
@@ -285,52 +235,284 @@ impl KeyPair {
                 let inner = EcKey::generate(&group)?;
                 Self::from_ec_key(inner, algorithm)
             }
-            #[cfg(feature = "dnssec-ring")]
-            Algorithm::ED25519 => Err(DnsSecErrorKind::Message(
-                "use generate_pkcs8 for generating private key and encoding",
-            )
-            .into()),
-            _ => Err(DnsSecErrorKind::Message("openssl nor ring feature(s) not enabled").into()),
+            _ => {
+                Err(format!("unsupported Algorithm for ECDSA key generation: {algorithm:?}").into())
+            }
         }
     }
 
-    /// Generates a key, securing it with pkcs8
-    #[cfg(feature = "dnssec-ring")]
-    pub fn generate_pkcs8(algorithm: Algorithm) -> DnsSecResult<Vec<u8>> {
-        #[allow(deprecated)]
+    /// Decode signing key pair from bytes according to the given `format`.
+    pub fn decode_key(
+        bytes: &[u8],
+        password: Option<&str>,
+        algorithm: Algorithm,
+        format: KeyFormat,
+    ) -> DnsSecResult<Self> {
         match algorithm {
-            Algorithm::Unknown(_) => Err(DnsSecErrorKind::Message("unknown algorithm").into()),
-            #[cfg(feature = "dnssec-openssl")]
-            Algorithm::RSASHA1
-            | Algorithm::RSASHA1NSEC3SHA1
-            | Algorithm::RSASHA256
-            | Algorithm::RSASHA512 => {
-                Err(DnsSecErrorKind::Message("openssl does not yet support pkcs8").into())
+            Algorithm::ECDSAP256SHA256 | Algorithm::ECDSAP384SHA384 => {}
+            e => {
+                return Err(format!("invalid Algorithm for EcSigningKey: {e:?}").into());
             }
-            #[cfg(feature = "dnssec-ring")]
-            Algorithm::ECDSAP256SHA256 => {
-                let rng = rand::SystemRandom::new();
-                EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
-                    .map_err(Into::into)
-                    .map(|pkcs8_bytes| pkcs8_bytes.as_ref().to_vec())
+        }
+
+        let key = match format {
+            KeyFormat::Der => EcKey::private_key_from_der(bytes)
+                .map_err(|e| format!("error reading EC key as DER: {e}"))?,
+            KeyFormat::Pem => {
+                //  empty string prevents openssl from triggering a read from stdin...
+                let password = password.unwrap_or("");
+                EcKey::private_key_from_pem_passphrase(bytes, password.as_bytes())
+                    .map_err(|e| format!("could not decode EC key from PEM, bad password?: {e}"))?
             }
-            #[cfg(feature = "dnssec-ring")]
-            Algorithm::ECDSAP384SHA384 => {
-                let rng = rand::SystemRandom::new();
-                EcdsaKeyPair::generate_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, &rng)
-                    .map_err(Into::into)
-                    .map(|pkcs8_bytes| pkcs8_bytes.as_ref().to_vec())
+            e => {
+                return Err(
+                    format!("unsupported key format with EC key (DER or PEM only): {e:?}").into(),
+                )
             }
-            #[cfg(feature = "dnssec-ring")]
-            Algorithm::ED25519 => {
-                let rng = rand::SystemRandom::new();
-                Ed25519KeyPair::generate_pkcs8(&rng)
-                    .map_err(Into::into)
-                    .map(|pkcs8_bytes| pkcs8_bytes.as_ref().to_vec())
-            }
-            _ => Err(DnsSecErrorKind::Message("openssl nor ring feature(s) not enabled").into()),
+        };
+
+        Ok(Self::from_ec_key(key, algorithm)
+            .map_err(|e| format!("could not decode EC key: {e}"))?)
+    }
+
+    /// Creates an elliptic curve key pair.
+    ///
+    /// Errors unless the given algorithm is one of the following:
+    ///
+    /// - [`Algorithm::ECDSAP256SHA256`]
+    /// - [`Algorithm::ECDSAP384SHA384`]
+    pub fn from_ec_key(ec_key: EcKey<Private>, algorithm: Algorithm) -> DnsSecResult<Self> {
+        Self::from_ec_pkey(PKey::from_ec_key(ec_key)?, algorithm)
+    }
+
+    /// Given a known pkey of an RSA key, return the wrapped key pair.
+    ///
+    /// Errors unless the given algorithm is one of the following:
+    ///
+    /// - [`Algorithm::ECDSAP256SHA256`]
+    /// - [`Algorithm::ECDSAP384SHA384`]
+    pub fn from_ec_pkey(inner: PKey<Private>, algorithm: Algorithm) -> DnsSecResult<Self> {
+        match algorithm {
+            Algorithm::ECDSAP256SHA256 | Algorithm::ECDSAP384SHA384 => Ok(Self {
+                inner,
+                algorithm: DigestType::from(algorithm),
+            }),
+            _ => Err(DnsSecErrorKind::Message("unsupported signing algorithm").into()),
         }
     }
+
+    /// Encode the key pair to DER-encoded ASN.1 bytes.
+    pub fn encode_der(&self) -> DnsSecResult<Vec<u8>> {
+        self.inner
+            .private_key_to_der()
+            .map_err(|e| format!("error writing key as DER: {e}").into())
+    }
+
+    /// Encode the key pair to DER-encoded ASN.1 bytes, optionally encrypted with `password`.
+    pub fn encode_pem(&self, password: Option<&str>) -> DnsSecResult<Vec<u8>> {
+        if let Some(password) = password {
+            self.inner
+                .private_key_to_pem_pkcs8_passphrase(Cipher::aes_256_cbc(), password.as_bytes())
+        } else {
+            self.inner.private_key_to_pem_pkcs8()
+        }
+        .map_err(|e| format!("error writing key as PEM: {e}").into())
+    }
+}
+
+#[cfg(feature = "dnssec-openssl")]
+impl SigningKey for EcSigningKey {
+    fn sign(&self, tbs: &TBS) -> DnsSecResult<Vec<u8>> {
+        let digest = self.algorithm.to_openssl_digest()?;
+        let mut signer = openssl::sign::Signer::new(digest, &self.inner)?;
+        signer.update(tbs.as_ref())?;
+        let bytes = signer.sign_to_vec()?;
+
+        // Convert DER signature to raw signature (see RFC 6605 Section 4)
+        if bytes.len() < 8 {
+            return Err("unexpected signature format (length too short)".into());
+        }
+        let expect = |pos: usize, expected: u8| -> DnsSecResult<()> {
+            if bytes[pos] != expected {
+                return Err(format!("unexpected signature format ({pos}, {expected}))").into());
+            }
+            Ok(())
+        };
+        // Sanity checks
+        expect(0, 0x30)?;
+        expect(1, (bytes.len() - 2) as u8)?;
+        expect(2, 0x02)?;
+        let p1_len = bytes[3] as usize;
+        let p2_pos = 4 + p1_len;
+        expect(p2_pos, 0x02)?;
+        let p2_len = bytes[p2_pos + 1] as usize;
+        if p2_pos + 2 + p2_len > bytes.len() {
+            return Err("unexpected signature format (invalid length)".into());
+        }
+
+        let p1 = &bytes[4..p2_pos];
+        let p2 = &bytes[p2_pos + 2..p2_pos + 2 + p2_len];
+
+        // For P-256, each integer MUST be encoded as 32 octets;
+        // for P-384, each integer MUST be encoded as 48 octets.
+        let part_len = match self.algorithm {
+            DigestType::SHA256 => 32,
+            DigestType::SHA384 => 48,
+            _ => return Err("unexpected algorithm".into()),
+        };
+
+        let mut ret = Vec::<u8>::new();
+        {
+            let mut write_part = |mut part: &[u8]| -> DnsSecResult<()> {
+                // We need to pad or trim the octet string to expected length
+                if part.len() > part_len + 1 {
+                    return Err("invalid signature data".into());
+                }
+                if part.len() == part_len + 1 {
+                    // Trim leading zero
+                    if part[0] != 0x00 {
+                        return Err("invalid signature data".into());
+                    }
+                    part = &part[1..];
+                }
+
+                // Pad with zeros. All numbers are big-endian here.
+                ret.extend(iter::repeat(0x00).take(part_len - part.len()));
+                ret.extend(part);
+                Ok(())
+            };
+            write_part(p1)?;
+            write_part(p2)?;
+        }
+        assert_eq!(ret.len(), part_len * 2);
+        Ok(ret)
+    }
+
+    fn to_public_key(&self) -> DnsSecResult<PublicKeyBuf> {
+        let ec = self.inner.ec_key()?;
+        PublicKeyBuf::from_ec(&ec)
+    }
+}
+
+/// An ECDSA signing key pair (backed by ring).
+#[cfg(feature = "dnssec-ring")]
+pub struct EcdsaSigningKey {
+    inner: EcdsaKeyPair,
+}
+
+#[cfg(feature = "dnssec-ring")]
+impl EcdsaSigningKey {
+    /// Decode signing key pair from DER-encoded PKCS#8 bytes.
+    ///
+    /// Errors unless the given algorithm is one of the following:
+    ///
+    /// - [`Algorithm::ECDSAP256SHA256`]
+    /// - [`Algorithm::ECDSAP384SHA384`]
+    pub fn from_pkcs8(bytes: &[u8], algorithm: Algorithm) -> DnsSecResult<Self> {
+        let rng = SystemRandom::new();
+        let ring_algorithm = if algorithm == Algorithm::ECDSAP256SHA256 {
+            &ECDSA_P256_SHA256_FIXED_SIGNING
+        } else if algorithm == Algorithm::ECDSAP384SHA384 {
+            &ECDSA_P384_SHA384_FIXED_SIGNING
+        } else {
+            return Err(DnsSecErrorKind::Message("unsupported algorithm").into());
+        };
+
+        Ok(Self {
+            inner: EcdsaKeyPair::from_pkcs8(ring_algorithm, bytes, &rng)?,
+        })
+    }
+
+    /// Creates an ECDSA key pair with ring.
+    pub fn from_ecdsa(inner: EcdsaKeyPair) -> Self {
+        Self { inner }
+    }
+
+    /// Generate signing key pair and return the DER-encoded PKCS#8 bytes.
+    ///
+    /// Errors unless the given algorithm is one of the following:
+    ///
+    /// - [`Algorithm::ECDSAP256SHA256`]
+    /// - [`Algorithm::ECDSAP384SHA384`]
+    pub fn generate_pkcs8(algorithm: Algorithm) -> DnsSecResult<Vec<u8>> {
+        let rng = SystemRandom::new();
+        let alg = if algorithm == Algorithm::ECDSAP256SHA256 {
+            &ECDSA_P256_SHA256_FIXED_SIGNING
+        } else if algorithm == Algorithm::ECDSAP384SHA384 {
+            &ECDSA_P384_SHA384_FIXED_SIGNING
+        } else {
+            return Err(DnsSecErrorKind::Message("unsupported algorithm").into());
+        };
+
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(alg, &rng)?;
+        Ok(pkcs8.as_ref().to_vec())
+    }
+}
+
+#[cfg(feature = "dnssec-ring")]
+impl SigningKey for EcdsaSigningKey {
+    fn sign(&self, tbs: &TBS) -> DnsSecResult<Vec<u8>> {
+        let rng = rand::SystemRandom::new();
+        Ok(self.inner.sign(&rng, tbs.as_ref())?.as_ref().to_vec())
+    }
+
+    fn to_public_key(&self) -> DnsSecResult<PublicKeyBuf> {
+        let mut bytes = self.inner.public_key().as_ref().to_vec();
+        bytes.remove(0);
+        Ok(PublicKeyBuf::new(bytes))
+    }
+}
+
+/// An ECDSA signing key pair (backed by ring).
+#[cfg(feature = "dnssec-ring")]
+pub struct Ed25519SigningKey {
+    inner: Ed25519KeyPair,
+}
+
+#[cfg(feature = "dnssec-ring")]
+impl Ed25519SigningKey {
+    /// Decode signing key pair from DER-encoded PKCS#8 bytes.
+    pub fn from_pkcs8(bytes: &[u8]) -> DnsSecResult<Self> {
+        Ok(Self {
+            inner: Ed25519KeyPair::from_pkcs8(bytes)?,
+        })
+    }
+
+    /// Creates an ED25519 keypair.
+    pub fn from_ed25519(inner: Ed25519KeyPair) -> Self {
+        Self { inner }
+    }
+
+    /// Generate signing key pair and return the DER-encoded PKCS#8 bytes.
+    pub fn generate_pkcs8() -> DnsSecResult<Vec<u8>> {
+        let rng = rand::SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)?;
+        Ok(pkcs8.as_ref().to_vec())
+    }
+}
+
+#[cfg(feature = "dnssec-ring")]
+impl SigningKey for Ed25519SigningKey {
+    fn sign(&self, tbs: &TBS) -> DnsSecResult<Vec<u8>> {
+        Ok(self.inner.sign(tbs.as_ref()).as_ref().to_vec())
+    }
+
+    fn to_public_key(&self) -> DnsSecResult<PublicKeyBuf> {
+        Ok(PublicKeyBuf::new(self.inner.public_key().as_ref().to_vec()))
+    }
+}
+
+/// A key that can be used to sign records.
+pub trait SigningKey: Send + Sync + 'static {
+    /// Sign DNS records.
+    ///
+    /// # Return value
+    ///
+    /// The signature, ready to be stored in an `RData::RRSIG`.
+    fn sign(&self, tbs: &TBS) -> DnsSecResult<Vec<u8>>;
+
+    /// Returns a [`PublicKeyBuf`] for this [`SigningKey`].
+    fn to_public_key(&self) -> DnsSecResult<PublicKeyBuf>;
 }
 
 #[cfg(any(feature = "dnssec-openssl", feature = "dnssec-ring"))]
@@ -342,54 +524,71 @@ mod tests {
     #[cfg(feature = "dnssec-openssl")]
     #[test]
     fn test_rsa() {
-        public_key_test(Algorithm::RSASHA256, KeyFormat::Der);
-        hash_test(Algorithm::RSASHA256, KeyFormat::Der);
+        let algorithm = Algorithm::RSASHA256;
+        let rsa = RsaSigningKey::generate(algorithm).unwrap();
+        public_key_test(&rsa, algorithm);
+        let neg = RsaSigningKey::generate(algorithm).unwrap();
+        hash_test(&rsa, &neg, algorithm);
     }
 
     #[cfg(feature = "dnssec-openssl")]
     #[test]
     fn test_ec_p256() {
-        public_key_test(Algorithm::ECDSAP256SHA256, KeyFormat::Der);
-        hash_test(Algorithm::ECDSAP256SHA256, KeyFormat::Der);
+        let algorithm = Algorithm::ECDSAP256SHA256;
+        let ec = EcSigningKey::generate(algorithm).unwrap();
+        public_key_test(&ec, algorithm);
+        let neg = EcSigningKey::generate(algorithm).unwrap();
+        hash_test(&ec, &neg, algorithm);
     }
 
     #[cfg(feature = "dnssec-ring")]
     #[test]
     fn test_ec_p256_pkcs8() {
-        public_key_test(Algorithm::ECDSAP256SHA256, KeyFormat::Pkcs8);
-        hash_test(Algorithm::ECDSAP256SHA256, KeyFormat::Pkcs8);
+        let algorithm = Algorithm::ECDSAP256SHA256;
+        let ec_pkcs8 = EcdsaSigningKey::generate_pkcs8(algorithm).unwrap();
+        let ec = EcdsaSigningKey::from_pkcs8(&ec_pkcs8, algorithm).unwrap();
+        public_key_test(&ec, algorithm);
+        let neg_pkcs8 = EcdsaSigningKey::generate_pkcs8(algorithm).unwrap();
+        let neg = EcdsaSigningKey::from_pkcs8(&neg_pkcs8, algorithm).unwrap();
+        hash_test(&ec, &neg, Algorithm::ECDSAP256SHA256);
     }
 
     #[cfg(feature = "dnssec-openssl")]
     #[test]
     fn test_ec_p384() {
-        public_key_test(Algorithm::ECDSAP384SHA384, KeyFormat::Der);
-        hash_test(Algorithm::ECDSAP384SHA384, KeyFormat::Der);
+        let algorithm = Algorithm::ECDSAP384SHA384;
+        let ec = EcSigningKey::generate(algorithm).unwrap();
+        public_key_test(&ec, algorithm);
+        let neg = EcSigningKey::generate(algorithm).unwrap();
+        hash_test(&ec, &neg, algorithm);
     }
 
     #[cfg(feature = "dnssec-ring")]
     #[test]
     fn test_ec_p384_pkcs8() {
-        public_key_test(Algorithm::ECDSAP384SHA384, KeyFormat::Pkcs8);
-        hash_test(Algorithm::ECDSAP384SHA384, KeyFormat::Pkcs8);
+        let algorithm = Algorithm::ECDSAP384SHA384;
+        let ec_pkcs8 = EcdsaSigningKey::generate_pkcs8(algorithm).unwrap();
+        let ec = EcdsaSigningKey::from_pkcs8(&ec_pkcs8, algorithm).unwrap();
+        public_key_test(&ec, algorithm);
+        let neg_pkcs8 = EcdsaSigningKey::generate_pkcs8(algorithm).unwrap();
+        let neg = EcdsaSigningKey::from_pkcs8(&neg_pkcs8, algorithm).unwrap();
+        hash_test(&ec, &neg, Algorithm::ECDSAP256SHA256);
     }
 
     #[cfg(feature = "dnssec-ring")]
     #[test]
     fn test_ed25519() {
-        public_key_test(Algorithm::ED25519, KeyFormat::Pkcs8);
-        hash_test(Algorithm::ED25519, KeyFormat::Pkcs8);
+        let algorithm = Algorithm::ED25519;
+        let key = Ed25519SigningKey::generate_pkcs8().unwrap();
+        let ed = Ed25519SigningKey::from_pkcs8(&key).unwrap();
+        public_key_test(&ed, algorithm);
+        let neg_pkcs8 = Ed25519SigningKey::generate_pkcs8().unwrap();
+        let neg = Ed25519SigningKey::from_pkcs8(&neg_pkcs8).unwrap();
+        hash_test(&ed, &neg, algorithm);
     }
 
     #[allow(clippy::uninlined_format_args)]
-    fn public_key_test(algorithm: Algorithm, key_format: KeyFormat) {
-        let key = key_format
-            .decode_key(
-                &key_format.generate_and_encode(algorithm, None).unwrap(),
-                None,
-                algorithm,
-            )
-            .unwrap();
+    fn public_key_test(key: &dyn SigningKey, algorithm: Algorithm) {
         let pk = key.to_public_key().unwrap();
 
         let tbs = TBS::from(&b"www.example.com"[..]);
@@ -408,33 +607,17 @@ mod tests {
     }
 
     #[allow(clippy::uninlined_format_args)]
-    fn hash_test(algorithm: Algorithm, key_format: KeyFormat) {
+    fn hash_test(key: &dyn SigningKey, neg: &dyn SigningKey, algorithm: Algorithm) {
         let tbs = TBS::from(&b"www.example.com"[..]);
 
         // TODO: convert to stored keys...
-        let key = key_format
-            .decode_key(
-                &key_format.generate_and_encode(algorithm, None).unwrap(),
-                None,
-                algorithm,
-            )
-            .unwrap();
         let pub_key = key.to_public_key().unwrap();
-
-        let neg = key_format
-            .decode_key(
-                &key_format.generate_and_encode(algorithm, None).unwrap(),
-                None,
-                algorithm,
-            )
-            .unwrap();
         let neg_pub_key = neg.to_public_key().unwrap();
 
         let sig = key.sign(&tbs).unwrap();
         assert!(
             pub_key.verify(algorithm, tbs.as_ref(), &sig).is_ok(),
-            "algorithm: {:?}",
-            algorithm
+            "algorithm: {algorithm:?}",
         );
         assert!(
             key.to_public_key()
@@ -442,8 +625,7 @@ mod tests {
                 .to_dnskey(algorithm)
                 .verify(tbs.as_ref(), &sig)
                 .is_ok(),
-            "algorithm: {:?} (dnskey)",
-            algorithm
+            "algorithm: {algorithm:?} (dnskey)",
         );
         assert!(
             neg_pub_key.verify(algorithm, tbs.as_ref(), &sig).is_err(),

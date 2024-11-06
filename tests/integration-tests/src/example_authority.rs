@@ -202,12 +202,11 @@ pub fn create_secure_example() -> InMemoryAuthority {
     use time::Duration;
 
     let mut authority = create_example();
-    let rsa = Rsa::generate(2_048).unwrap();
-    let key = KeyPair::from_rsa(rsa, Algorithm::RSASHA256).unwrap();
+    let key = RsaSigningKey::generate(Algorithm::RSASHA256).unwrap();
     let dnskey = key.to_public_key().unwrap().to_dnskey(Algorithm::RSASHA256);
     let signer = SigSigner::dnssec(
         dnskey,
-        key,
+        Box::new(key),
         authority.origin().clone().into(),
         Duration::weeks(1).try_into().unwrap(),
     );

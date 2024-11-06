@@ -247,6 +247,7 @@ impl TlsCertConfig {
 ///  keys = [ "my_rsa_2048|RSASHA256", "/path/to/my_ed25519|ED25519" ]
 #[cfg(feature = "dnssec")]
 fn load_key(zone_name: Name, key_config: &KeyConfig) -> Result<SigSigner, String> {
+    use hickory_proto::rr::dnssec::decode_key;
     use tracing::info;
 
     use std::fs::File;
@@ -273,9 +274,8 @@ fn load_key(zone_name: Name, key_config: &KeyConfig) -> Result<SigSigner, String
         file.read_to_end(&mut key_bytes)
             .map_err(|e| format!("could not read key from: {key_path:?}: {e}"))?;
 
-        format
-            .decode_key(&key_bytes, key_config.password(), algorithm)
-            .map_err(|e| format!("could not decode key: {e}"))?
+        decode_key(&key_bytes, key_config.password(), algorithm, format)
+            .map_err(|e| format!("error decoding key: {e}"))?
     };
 
     let name = key_config

@@ -28,6 +28,11 @@ mod verifier;
 
 pub use self::algorithm::Algorithm;
 pub use self::digest_type::DigestType;
+pub use self::keypair::{decode_key, SigningKey};
+#[cfg(feature = "dnssec-openssl")]
+pub use self::keypair::{EcSigningKey, RsaSigningKey};
+#[cfg(feature = "dnssec-ring")]
+pub use self::keypair::{EcdsaSigningKey, Ed25519SigningKey};
 pub use self::nsec3::Nsec3HashAlgorithm;
 pub use self::proof::{Proof, ProofError, ProofErrorKind, ProofFlags, Proven};
 pub use self::public_key::PublicKey;
@@ -67,7 +72,6 @@ impl Digest {
 
 #[cfg(any(feature = "dnssec-openssl", feature = "dnssec-ring"))]
 pub use self::key_format::KeyFormat;
-pub use self::keypair::KeyPair;
 pub use self::signer::SigSigner;
 
 #[cfg(feature = "dnssec-openssl")]
